@@ -1,10 +1,10 @@
 # Fara E2E Test Suite
 
-A production-ready AI-powered end-to-end testing framework that uses vision-language models to interact with web applications through natural language test definitions.
+A production-ready AI-powered end-to-end testing framework that uses vision-language models to interact with web applications through natural language test definitions. Configured for [Microsoft Fara 7b GGUF](https://huggingface.co/bartowski/microsoft_Fara-7B-GGUF) model and [LM Studio](https://lmstudio.ai/) inference.
 
 ## Features
 
-- **AI-Powered Testing**: Uses vision-language models (via OpenAI-compatible API) to understand and interact with web pages. Configured for Microsoft Fara 7b model.
+- **AI-Powered Testing**: Uses vision-language models (via OpenAI-compatible API) to understand and interact with web pages.
 - **Natural Language Tests**: Define tests in simple YAML/JSON with objectives, pass/fail criteria
 - **Multi-Browser Support**: Chromium, Firefox, and WebKit via Playwright
 - **Parallel Execution**: Run multiple tests concurrently with configurable workers
@@ -12,7 +12,6 @@ A production-ready AI-powered end-to-end testing framework that uses vision-lang
 - **Test Tagging**: Organize tests with tags for selective execution
 - **Intelligent Waiting**: Smart page load detection instead of fixed delays
 - **Self-Healing**: Pre-flight element validation and retry mechanisms
-- **CI/CD Ready**: JUnit reports and Docker support for integration
 
 ## Quick Start
 
