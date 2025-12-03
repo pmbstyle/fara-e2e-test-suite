@@ -1,0 +1,19 @@
+id: signup-demo
+objective: Go to the provided URL and complete the sign-up form, enter credentials and submit the form. Task ending on the dashboard.
+pass_criteria:
+  - The user is registered successfully.
+  - The page redirects to the dashboard with a welcome message after sign-up.
+fail_criteria:
+  - Registration fails or displays an error.
+  - No redirect to the dashboard after submitting the form or page is not dashboard.
+credentials:
+  name: FaraAgent
+  email: user@example.com
+  password: "12345"
+notes: Update start_url to your application under test before running.
+start_url: http://localhost:8080/#/sign-up
+tags:
+  - auth
+priority: 1
+max_rounds: 12
+retry_count: 0
