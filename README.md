@@ -197,6 +197,38 @@ The AI agent can perform:
 | `reload` | Refresh page |
 | `terminate` | End test with verdict |
 
+## MCP Integration (Codex, Cursor, Claude Code)
+
+Expose the suite as a local MCP server via `mcp_server.py` (stdio transport).
+
+- Start server: `python mcp_server.py` (after `pip install -r requirements.txt` and `playwright install chromium firefox webkit`).
+- Tools: `list_tasks`, `create_task`, `run_task`, `list_runs`, `get_run_status`, `get_report`, `retry_run`.
+- Output: compact summary plus `file://` links to JSON/HTML reports and screenshots. Headless by default; set `headful_debug=true` in `run_task` args for debugging.
+
+### Codex CLI
+- In `~/.codex/config.toml` add:
+  ```toml
+  [mcp_servers."fara-e2e"]
+  command = "python"
+  args = ["path-to-fara-e2e/mcp_server.py"]
+  transport = "stdio"
+  ```
+- Restart Codex, then call tools (e.g., `run_task` with `{"task_id":"signup-demo"}`).
+
+### Cursor
+- Settings → MCP → Add Custom Server:
+  - Command: `python`
+  - Args: `path-to-fara-e2e/mcp_server.py`
+  - Transport: stdio (default)
+- Restart Cursor and use MCP tools.
+
+### Claude Code (Desktop / VS Code)
+- In Claude Code MCP settings, add a custom server:
+  - Command: `python`
+  - Args: `path-to-fara-e2e/mcp_server.py`
+  - Transport: stdio
+- Reload Claude Code and invoke tools (e.g., `list_tasks`, `run_task`).
+
 ## Running Tests
 
 ```bash

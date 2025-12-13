@@ -3,3 +3,7 @@
 /reporters/__pycache__
 /tests/unit/__pycache__
 /tests/__pycache__
+mcp_server.log
+*.json
+*.yaml
+/tmp-site
