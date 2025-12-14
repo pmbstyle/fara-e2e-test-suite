@@ -1,6 +1,6 @@
 # Fara E2E Test Suite
 
-A production-ready AI-powered end-to-end testing framework that uses vision-language models to interact with web applications through natural language test definitions. Configured for [Microsoft Fara 7b GGUF](https://huggingface.co/bartowski/microsoft_Fara-7B-GGUF) model and [LM Studio](https://lmstudio.ai/) inference.
+An AI-powered end-to-end testing framework that uses vision-language models to interact with web applications through natural language test definitions. Configured for [Microsoft Fara 7b GGUF](https://huggingface.co/bartowski/microsoft_Fara-7B-GGUF) model and [LM Studio](https://lmstudio.ai/) inference.
 
 <a href="https://www.youtube.com/watch?v=ptI_Tz1mams"><img alt="image" src="https://github.com/user-attachments/assets/e7eccf41-8028-4444-b07b-db980dbf4129" /></a>
 
