@@ -226,6 +226,27 @@ class FaraAgent:
 
         return None
 
+    def _allowed_actions(self) -> set[str]:
+        """Contract actions exposed in the system prompt (keep Fara's API small)."""
+        return {
+            "key",
+            "type",
+            "mouse_move",
+            "left_click",
+            "scroll",
+            "visit_url",
+            "web_search",
+            "history_back",
+            "wait",
+            "terminate",
+        }
+
+    def _is_action_allowed(self, action_args: dict[str, Any] | None) -> bool:
+        if not action_args:
+            return False
+        action = str(action_args.get("action") or "")
+        return action in self._allowed_actions()
+
     def _convert_resized_coords_to_viewport(self, coords: List[float]) -> List[float]:
         """Scale coordinates from resized prompt image back to browser viewport."""
         if not self.last_im_size:
@@ -712,6 +733,10 @@ class FaraAgent:
                 clicked = (tr.get("clicked_text") or "").strip().lower()
                 if clicked and clicked in click_targets:
                     return True, f"All URL-scoped pass criteria satisfied and clicked '{clicked}' navigated to final URL."
+            # Fallback: element text may be missing; accept any recent click-driven transition to the final URL.
+            for tr in list(reversed(self._transitions))[:2]:
+                if tr.get("to") == final_url_norm and tr.get("action") == "left_click":
+                    return True, "All URL-scoped pass criteria satisfied and a recent click navigated to the final URL."
             return False, None
 
         # No click targets; don't guess.
@@ -1001,11 +1026,13 @@ class FaraAgent:
                 if (self.viewport_width, self.viewport_height) != (target_w, target_h):
                     await self.browser.set_viewport_size(target_w, target_h)
                     self.viewport_width, self.viewport_height = target_w, target_h
+                    # Ensure scaling is 1:1 if we sync successfully.
+                    self.last_im_size = (target_w, target_h)
                     await asyncio.sleep(0.2)
                     screenshot = await self._get_screenshot()
                     prompt_data = get_computer_use_system_prompt(screenshot, self.MLM_PROCESSOR_IM_CFG)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.logger.warning(f"Viewport sync failed; falling back to coordinate scaling: {exc}")
         system_prompt = SystemMessage(
             content=prompt_data["content"]
             + "\n\nYou are executing an end-to-end test case. Be decisive and avoid loops."
@@ -1031,8 +1058,9 @@ class FaraAgent:
                 page_changed=self._page_changed,
             )
             if text_status is not None:
-                success = bool(text_status)
-                fail_reason = text_reason or ("Auto pass" if success else "Auto fail")
+                # This check is intentionally auto-FAIL only.
+                success = False
+                fail_reason = text_reason or "Auto fail: expected text missing after navigation."
                 screenshot_path = None
                 if self.save_screenshots:
                     screenshot_path = screenshot_dir / f"step-{round_num + 1:02d}.png"
@@ -1044,7 +1072,7 @@ class FaraAgent:
                         action="auto_terminate",
                         arguments={
                             "auto": True,
-                            "status": "success" if success else "failure",
+                            "status": "failure",
                             "source": "text_expectations",
                         },
                         model_response="",
@@ -1123,13 +1151,14 @@ class FaraAgent:
                 await self.browser.update_overlay(f"[INFO] Model response: {response[:300]}")
 
             action_args = self._parse_action(response)
-            if not action_args:
+            if not action_args or not self._is_action_allowed(action_args):
                 # One repair turn: ask for a strict tool_call only.
                 repair_prompt = UserMessage(
                     content=(
                         "Return ONLY:\n<tool_call>\n{...}\n</tool_call>\n"
                         "No whitespace or text outside the tags. No markdown. No explanations.\n"
-                        "Inside {…} return JSON like {\"name\":\"computer_use\",\"arguments\":{...}}."
+                        f"Inside {{…}} return JSON like {{\"name\":\"computer_use\",\"arguments\":{{...}}}}.\n"
+                        f"Allowed actions: {sorted(self._allowed_actions())}"
                     )
                 )
                 try:
@@ -1137,7 +1166,7 @@ class FaraAgent:
                     action_args = self._parse_action(response)
                 except Exception:
                     action_args = None
-                if not action_args:
+                if not action_args or not self._is_action_allowed(action_args):
                     fail_reason = "Model did not return a valid tool call."
                     break
 
@@ -1248,12 +1277,16 @@ class FaraAgent:
                 )
                 break
 
-            # Wait for page to stabilize
-            await asyncio.sleep(1.5)
-            try:
-                await self.browser.wait_for_load_state("domcontentloaded", timeout=3000)
-            except Exception:
-                pass
+            # Wait for page to stabilize (action-aware: SPA-friendly but faster).
+            action_name = str(action_args.get("action") or "")
+            if action_name in ("scroll", "mouse_move", "hover"):
+                await asyncio.sleep(0.2)
+            else:
+                try:
+                    await self.browser.wait_for_load_state("domcontentloaded", timeout=2500)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.35)
 
             screenshot = await self._get_screenshot()
             page_title = await self.browser.get_title()
