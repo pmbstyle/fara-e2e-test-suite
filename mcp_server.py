@@ -32,9 +32,10 @@ import uvicorn
 
 from config import load_config
 from reporters import HTMLReporter, JSONReporter
-from task_loader import discover_tasks, load_task_file
+from task_loader import discover_tasks, load_task_file, validate_task
 from test_runner import E2ETestRunner
 from test_types import TestCase, TestRunResult
+from exceptions import TaskValidationError
 
 logger = logging.getLogger("fara_mcp")
 logger.propagate = False
@@ -42,6 +43,7 @@ LOG_FILE = Path(__file__).with_name("mcp_server.log")
 
 ROOT = Path(__file__).parent
 TASKS_DIR = ROOT / "tasks"
+GENERATED_TASKS_DIR = TASKS_DIR / "generated"
 REPORTS_DIR = ROOT / "reports"
 SCREENSHOTS_DIR = ROOT / "screenshots"
 RUN_INDEX_PATH = REPORTS_DIR / "run_index.json"
@@ -96,6 +98,7 @@ class RunRecord:
     started_at: str
     finished_at: str | None
     report_paths: dict[str, str] | None
+    partial_report: str | None = None
 
 
 class RunIndex:
@@ -133,36 +136,57 @@ class RunIndex:
 
 
 class TaskStore:
-    """Lightweight task store backed by the existing tasks directory."""
+    """Lightweight task store backed by the tasks directories (permanent + generated)."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, generated: Path):
         self.root = root
+        self.generated = generated
         self.root.mkdir(parents=True, exist_ok=True)
+        self.generated.mkdir(parents=True, exist_ok=True)
 
     def list_tasks(self) -> list[dict[str, Any]]:
-        tasks = discover_tasks(self.root)
+        # Prefer generated overrides if IDs collide.
+        merged: dict[str, tuple[TestCase, str]] = {}
+        for case, source in [
+            *[(t, "permanent") for t in discover_tasks(self.root, include_skipped=True)],
+            *[(t, "generated") for t in discover_tasks(self.generated, include_skipped=True)],
+        ]:
+            merged[case.id] = (case, source)
+
         return [
             {
-                "id": t.id,
-                "objective": t.objective,
-                "tags": sorted(t.tags),
-                "priority": t.priority,
-                "skip": t.skip,
+                "id": case.id,
+                "objective": case.objective,
+                "tags": sorted(case.tags),
+                "priority": case.priority,
+                "skip": case.skip,
+                "source": source,
             }
-            for t in tasks
+            for case, source in merged.values()
         ]
 
     def load(self, task_id: str) -> TestCase:
-        path = self.root / f"{task_id}.yaml"
-        if not path.exists():
-            raise FileNotFoundError(f"Task not found: {task_id}")
-        return load_task_file(path)
+        for base in (self.generated, self.root):
+            path = base / f"{task_id}.yaml"
+            if path.exists():
+                return load_task_file(path)
+        raise FileNotFoundError(f"Task not found: {task_id}")
 
     def create(self, task: dict[str, Any]) -> str:
+        errors = validate_task(task)
+        if errors:
+            raise TaskValidationError(
+                f"Invalid task payload: {'; '.join(errors)}",
+                task_id=str(task.get("id") or task.get("name") or ""),
+            )
         task_id = str(task.get("id") or task.get("name") or f"task-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}")
         path = self.root / f"{task_id}.yaml"
         if path.exists():
             raise FileExistsError(f"Task already exists: {task_id}")
+        # Keep generated tasks separate from permanent ones.
+        path = self.generated / f"{task_id}.yaml"
+        if path.exists():
+            raise FileExistsError(f"Generated task already exists: {task_id}")
         # Persist as YAML to stay compatible
         import yaml
 
@@ -175,7 +199,7 @@ class E2EMCPServer:
 
     def __init__(self) -> None:
         self.server = Server("fara-e2e-mcp", instructions="Run and inspect UI E2E tests")
-        self.task_store = TaskStore(TASKS_DIR)
+        self.task_store = TaskStore(TASKS_DIR, GENERATED_TASKS_DIR)
         self.run_index = RunIndex(RUN_INDEX_PATH)
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._semaphore = asyncio.Semaphore(1)  # limit concurrent Playwright runs
@@ -192,8 +216,48 @@ class E2EMCPServer:
                 ),
                 types.Tool(
                     name="create_task",
-                    description="Create a new task (YAML-compatible payload)",
-                    inputSchema={"type": "object", "properties": {}, "additionalProperties": True},
+                    description=(
+                        "Create a new natural-language E2E task. Always include the structured fields below and an ordered "
+                        "step-by-step guide for the objective so the agent can navigate without looping."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string", "description": "Task id/filename (defaults to autogenerated timestamp id)"},
+                            "objective": {"type": "string", "description": "Single-sentence goal of the test"},
+                            "objective_steps": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Ordered, concrete steps (3-10) the agent should follow to reach the objective",
+                            },
+                            "pass_criteria": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Conditions that must be true to count as PASS",
+                            },
+                            "fail_criteria": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Conditions that indicate FAILURE/blockers",
+                            },
+                            "start_url": {"type": "string", "description": "Optional starting URL for the flow"},
+                            "credentials": {
+                                "type": "object",
+                                "description": "Optional key/value secrets needed to log in or submit forms",
+                            },
+                            "notes": {"type": "string", "description": "Extra context to reduce ambiguity"},
+                            "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for selection (e.g., smoke, auth, p0)"},
+                            "priority": {"type": "integer", "description": "1-10 (1=highest); used for ordering"},
+                            "retry_count": {"type": "integer", "description": "Number of times to retry on failure"},
+                            "max_rounds": {"type": "integer", "description": "Max model action rounds before aborting"},
+                            "timeout_seconds": {"type": "number", "description": "Overall timeout for the task"},
+                            "owner": {"type": "string", "description": "Owner/team for the test"},
+                            "skip": {"type": "boolean", "description": "Mark true to skip the task"},
+                            "skip_reason": {"type": "string", "description": "Why the task is skipped"},
+                        },
+                        "required": ["objective", "objective_steps", "pass_criteria", "fail_criteria"],
+                        "additionalProperties": True,
+                    },
                 ),
                 types.Tool(
                     name="run_task",
@@ -294,6 +358,7 @@ class E2EMCPServer:
 
         logger.info("run_task enqueue: %s", task_id)
         run_id = f"{task_id}-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        partial_path = REPORTS_DIR / f"{run_id}-partial.json"
         record = RunRecord(
             run_id=run_id,
             task_id=task_id,
@@ -303,6 +368,7 @@ class E2EMCPServer:
             started_at=_now_iso(),
             finished_at=None,
             report_paths=None,
+            partial_report=_file_uri(partial_path),
         )
         self.run_index.put(record)
 
@@ -320,7 +386,7 @@ class E2EMCPServer:
 
             try:
                 runner = E2ETestRunner(config=config, logger=logger)
-                result = await runner.run_task_with_retries(case)
+                result = await runner.run_task_with_retries(case, trace_path=partial_path)
 
                 reporter = JSONReporter()
                 json_path = reporter.generate(result, REPORTS_DIR)
@@ -381,6 +447,14 @@ class E2EMCPServer:
         record = self.run_index.get(run_id)
         if not record:
             raise FileNotFoundError(f"Run not found: {run_id}")
+        # If still queued (worker not started), mark cancelled immediately.
+        if not task and record.status == "queued":
+            record.status = "error"
+            record.reason = "Cancelled"
+            record.finished_at = _now_iso()
+            record.success = False
+            self.run_index.put(record)
+            return {"run_id": run_id, "status": "cancelled"}
         if not task:
             return {"run_id": run_id, "status": record.status, "message": "Not running"}
         task.cancel()
@@ -388,6 +462,8 @@ class E2EMCPServer:
         record.reason = "Cancelled"
         record.finished_at = _now_iso()
         record.success = False
+        if record.partial_report:
+            record.report_paths = {"partial": record.partial_report}
         self.run_index.put(record)
         return {"run_id": run_id, "status": "cancelled"}
 

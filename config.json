@@ -9,6 +9,9 @@
   "max_n_images": 1,
   "downloads_folder": "./downloads",
   "show_overlay": true,
-  "show_click_markers": true
+  "show_click_markers": true,
+  "viewport_width": 1428,
+  "viewport_height": 896,
+  "sync_viewport_to_prompt": true,
+  "debug_log_requests": true
 }
-

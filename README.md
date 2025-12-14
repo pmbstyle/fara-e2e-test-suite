@@ -64,6 +64,11 @@ Create YAML files in the `tasks/` directory:
 ```yaml
 id: login-test
 objective: Log in and verify dashboard is visible
+objective_steps:
+  - Open the login page
+  - Enter the provided email and password
+  - Submit the form and wait for navigation
+  - Confirm the dashboard/home view is visible
 pass_criteria:
   - User is logged in successfully
   - Dashboard/home view is visible
@@ -136,6 +141,7 @@ python test_runner.py --output-format all
 |-------|------|----------|-------------|
 | `id` | string | Yes* | Unique identifier (defaults to filename) |
 | `objective` | string | Yes | What the test should accomplish |
+| `objective_steps` | list | Yes | Ordered, concrete steps the agent should follow to reach the objective |
 | `pass_criteria` | list | Yes | Conditions for test success |
 | `fail_criteria` | list | Yes | Conditions for test failure |
 | `start_url` | string | No | Initial page URL |

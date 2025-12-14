@@ -13,6 +13,7 @@ class TestCase:
 
     id: str
     objective: str
+    objective_steps: List[str]
     pass_criteria: List[str]
     fail_criteria: List[str]
     start_url: Optional[str] = None

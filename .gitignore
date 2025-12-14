@@ -7,3 +7,5 @@ mcp_server.log
 *.json
 *.yaml
 /tmp-site
+*.png
+/tmp_pyc

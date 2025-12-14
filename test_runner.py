@@ -34,6 +34,7 @@ class E2ETestRunner:
         self,
         case: TestCase,
         retry_attempt: int = 0,
+        trace_path: Optional[Path] = None,
     ) -> TestRunResult:
         """Run a single test case."""
         run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
@@ -49,9 +50,11 @@ class E2ETestRunner:
             "max_n_images": self.config.agent.max_n_images,
             "save_screenshots": self.config.reporting.save_screenshots,
             "screenshots_folder": str(self.config.reporting.screenshots_folder),
+            "reports_folder": str(self.config.reporting.reports_folder),
             "downloads_folder": str(self.config.reporting.downloads_folder),
             "show_overlay": self.config.browser.show_overlay,
             "show_click_markers": self.config.browser.show_click_markers,
+            "debug_log_requests": self.config.agent.debug_log_requests,
         }
         
         agent = FaraAgent(
@@ -68,6 +71,7 @@ class E2ETestRunner:
                 test_case=case,
                 run_id=f"{case.id}-{run_id}",
                 screenshots_root=self.config.reporting.screenshots_folder,
+                trace_path=trace_path,
             )
             result.retry_attempt = retry_attempt
             result.browser_type = self.config.browser.browser
@@ -89,7 +93,7 @@ class E2ETestRunner:
         finally:
             await agent.close()
 
-    async def run_task_with_retries(self, case: TestCase) -> TestRunResult:
+    async def run_task_with_retries(self, case: TestCase, trace_path: Optional[Path] = None) -> TestRunResult:
         """Run a task with configured retries."""
         retry_count = case.retry_count
         last_result = None
@@ -98,7 +102,7 @@ class E2ETestRunner:
             if attempt > 0:
                 self.logger.info(f"Retrying task {case.id} (attempt {attempt + 1}/{retry_count + 1})")
             
-            result = await self.run_task(case, retry_attempt=attempt)
+            result = await self.run_task(case, retry_attempt=attempt, trace_path=trace_path)
             last_result = result
             
             if result.success:

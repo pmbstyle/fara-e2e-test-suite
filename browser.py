@@ -101,6 +101,20 @@ class SimpleBrowser:
 
         self.logger.info(f"Browser started: {self.browser_type} (headless={self.headless})")
 
+    async def set_viewport_size(self, width: int, height: int) -> None:
+        """Resize the viewport to match the model's coordinate space (best-effort)."""
+        self._ensure_started()
+        if not self.page:
+            raise BrowserNotStartedError()
+        await self.page.set_viewport_size({"width": int(width), "height": int(height)})
+        self.viewport_width = int(width)
+        self.viewport_height = int(height)
+        # Re-inject helpers if needed (Playwright keeps them, but this is safe).
+        if self.show_overlay:
+            await self._inject_overlay()
+        if self.show_click_markers:
+            await self._inject_click_marker()
+
     def _handle_console(self, msg: Any) -> None:
         """Capture console messages."""
         self._console_messages.append({

@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -49,6 +50,7 @@ class FaraAgent:
         self.max_n_images = config.get("max_n_images", 1)
         self.downloads_folder = config.get("downloads_folder")
         self.message_history: list[UserMessage] = []
+        self.reasoning_history: list[str] = []
         self.show_overlay = config.get("show_overlay", not headless)
         self.show_click_markers = config.get("show_click_markers", not headless)
 
@@ -81,10 +83,19 @@ class FaraAgent:
         self.scroll_history: list[dict[str, Any]] = []
         self._click_counts: dict[tuple[int, int], int] = {}
         self._type_counts: dict[tuple[int, int], int] = {}
+        self._visit_counts: dict[str, int] = {}
         self._just_submitted: bool = False
         self._page_changed: bool = False
         self._last_url_norm: str | None = None
         self._console_errors: list[str] = []
+        self._current_run_id: Optional[str] = None
+        self._last_action_signature: Optional[str] = None
+        self._repeat_action_streak: int = 0
+        self._last_page_text: str = ""
+        self._visited_url_norms: set[str] = set()
+        self._page_changed_since_last_action: bool = False
+        self._verified_expectations: list[tuple[str, str]] = []
+        self._transitions: list[dict[str, Any]] = []
 
     async def start(self) -> None:
         """Initialize the agent."""
@@ -120,6 +131,40 @@ class FaraAgent:
             if self._is_lm_studio:
                 create_kwargs["top_p"] = 0.85
 
+            # Optional request logging for debugging context/loops.
+            if self.config.get("debug_log_requests"):
+                ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
+                run_dir = self._current_run_id or "unknown-run"
+                base_dir = Path(str(self.config.get("reports_folder") or "./reports"))
+                log_dir = base_dir / "model_requests" / run_dir
+                log_dir.mkdir(parents=True, exist_ok=True)
+                # Truncate any base64 image URLs to avoid huge logs
+                def _truncate_images(msgs: list[dict]) -> list[dict]:
+                    out = []
+                    for m in msgs:
+                        content = m.get("content")
+                        if isinstance(content, list):
+                            new_items = []
+                            for item in content:
+                                if isinstance(item, dict) and item.get("type") == "image_url":
+                                    # Keep a placeholder marker
+                                    new_items.append({"type": "image_url", "image_url": {"url": "<image_base64_truncated>"}})
+                                else:
+                                    new_items.append(item)
+                            m = {**m, "content": new_items}
+                        out.append(m)
+                    return out
+
+                payload = {
+                    "messages": _truncate_images(openai_messages),
+                    "create_kwargs": {k: v for k, v in create_kwargs.items() if k != "messages"},
+                }
+                log_path = log_dir / f"request-{ts}.json"
+                try:
+                    log_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                except Exception as exc:
+                    self.logger.warning(f"Failed to log request payload: {exc}")
+
             response = await self.client.chat.completions.create(**create_kwargs)
             content = response.choices[0].message.content
 
@@ -134,25 +179,50 @@ class FaraAgent:
 
     def _parse_action(self, response: str) -> Dict[str, Any] | None:
         """Parse tool call from model response."""
-        if "<tool_call>" not in response:
+        def _parse_tool_obj(obj: Any) -> Dict[str, Any] | None:
+            if not isinstance(obj, dict):
+                return None
+            # Preferred envelope
+            if obj.get("name") == "computer_use" and isinstance(obj.get("arguments"), dict):
+                return obj["arguments"]
+            # Sometimes models emit only arguments
+            if "action" in obj and isinstance(obj.get("action"), str):
+                return obj
             return None
 
-        try:
-            start = response.find("<tool_call>") + len("<tool_call>")
-            end = response.find("</tool_call>", start)
+        def _extract_between(tag: str) -> str | None:
+            open_tag = f"<{tag}>"
+            if open_tag not in response:
+                return None
+            start = response.find(open_tag) + len(open_tag)
+            end = response.find(f"</{tag}>", start)
             if end == -1:
                 end = len(response)
+            return response[start:end].strip()
 
-            json_str = response[start:end].strip()
-            tool_call = json.loads(json_str)
+        # 1) Tagged tool call
+        for tag in ("tool_call", "function_call"):
+            payload = _extract_between(tag)
+            if payload:
+                try:
+                    obj = json.loads(payload)
+                except Exception:
+                    obj = None
+                parsed = _parse_tool_obj(obj)
+                if parsed:
+                    return parsed
 
-            if tool_call.get("name") == "computer_use":
-                return tool_call.get("arguments", {})
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Failed to parse action JSON: {e}")
-            raise ActionParseError(f"Invalid JSON in tool call: {e}", raw_response=response)
-        except Exception as e:
-            self.logger.error(f"Failed to parse action: {e}")
+        # 2) Raw JSON fallback: attempt to parse the largest {...} block
+        try:
+            start = response.find("{")
+            end = response.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                obj = json.loads(response[start : end + 1])
+                parsed = _parse_tool_obj(obj)
+                if parsed:
+                    return parsed
+        except Exception:
+            pass
 
         return None
 
@@ -173,19 +243,11 @@ class FaraAgent:
             return f"https://www.bing.com/search?q={raw}"
         return f"https://{raw}"
 
-    def _prune_user_messages(self) -> list[UserMessage]:
-        """Keep a short text history while sending only one image (latest turn) to the model."""
+    def _latest_user_message(self) -> list[UserMessage]:
+        """Return only the latest user message (screenshot + state context)."""
         if not self.message_history:
             return []
-        pruned: list[UserMessage] = []
-        for msg in self.message_history[:-1]:
-            if isinstance(msg.content, list):
-                text_parts = [item for item in msg.content if not isinstance(item, ImageObj)]
-                pruned.append(UserMessage(content=text_parts or ["[previous screenshot omitted]"]))
-            else:
-                pruned.append(msg)
-        pruned.append(self.message_history[-1])
-        return pruned
+        return [self.message_history[-1]]
 
     async def _execute_action(self, action_args: Dict[str, Any]) -> str:
         """Execute a browser action with expanded action set."""
@@ -202,9 +264,13 @@ class FaraAgent:
                 if not url:
                     return "No URL provided."
                 target = self._normalize_url_or_search(str(url))
+                # Avoid wasting rounds re-visiting the exact same URL.
+                if self._normalize_for_compare(target) == self._normalize_for_compare(self.browser.get_url()):
+                    return "Already at that URL; no navigation performed."
                 await self.browser.goto(target)
                 # Use intelligent waiting
                 await self.browser.wait_for_load_state("networkidle", timeout=10000)
+                self._record_visit(target)
                 return f"I navigated to '{url}'."
 
             elif action == "left_click":
@@ -214,6 +280,18 @@ class FaraAgent:
                 
                 # Get element info before click
                 element_info = await self.browser.click(scaled[0], scaled[1])
+                try:
+                    clicked_text = (
+                        str(element_info.get("text")).strip()
+                        if element_info and element_info.get("found") and element_info.get("text")
+                        else None
+                    )
+                    if clicked_text:
+                        self.facts.append(f"Clicked: {clicked_text}" if len(clicked_text) < 80 else "Clicked: <text>")
+                        self.facts = self.facts[-10:]
+                    action_args["_clicked_text"] = clicked_text
+                except Exception:
+                    pass
                 
                 label = action_args.get("label", "") or ""
                 if any(
@@ -304,12 +382,15 @@ class FaraAgent:
             elif action == "scroll":
                 pixels = action_args.get("pixels", 0)
                 direction = "up" if pixels > 0 else "down"
-                if pixels > 0:
-                    await self.browser.page_up()
-                elif pixels < 0:
-                    await self.browser.page_down()
+                if abs(int(pixels)) < 300:
+                    await self.browser.scroll(int(pixels))
                 else:
-                    await self.browser.scroll(pixels)
+                    if pixels > 0:
+                        await self.browser.page_up()
+                    elif pixels < 0:
+                        await self.browser.page_down()
+                    else:
+                        await self.browser.scroll(0)
 
                 scroll_state = await self.browser.get_scroll_position()
                 self.scroll_history.append(
@@ -331,14 +412,17 @@ class FaraAgent:
 
             elif action == "history_back":
                 await self.browser.go_back()
+                self._record_visit(self.browser.get_url())
                 return "I went back to the previous page."
 
             elif action == "history_forward":
                 await self.browser.go_forward()
+                self._record_visit(self.browser.get_url())
                 return "I went forward to the next page."
 
             elif action == "reload":
                 await self.browser.reload()
+                self._record_visit(self.browser.get_url())
                 return "I reloaded the page."
 
             elif action == "web_search":
@@ -413,77 +497,250 @@ class FaraAgent:
     def _build_context_text(
         self, test_case: TestCase, action_history: list[str], rounds_left: int
     ) -> str:
-        """Assemble concise context for the model."""
+        """Assemble minimal context for the model (keep it a policy, not a planner)."""
         current_url = self.browser.get_url()
-        lines = [
-            f"Objective: {test_case.objective}",
-            f"Current URL: {current_url}",
-            f"Rounds left: {rounds_left}",
-            "",
-            "PASS criteria:",
-            *[f"- {item}" for item in test_case.pass_criteria],
-            "",
-            "FAIL criteria:",
-            *[f"- {item}" for item in test_case.fail_criteria],
-        ]
-        if test_case.credentials:
-            lines.append("")
-            lines.append("Credentials:")
-            for k, v in test_case.credentials.items():
-                lines.append(f"- {k}: {v}")
-        if test_case.notes:
-            lines.append("")
-            lines.append(f"Notes: {test_case.notes}")
-        if test_case.start_url and self.browser.get_url() != test_case.start_url:
-            lines.append("")
-            lines.append(
-                "You have left the starting page. Do NOT restart or refill the form unless an error requires it."
-            )
-            lines.append(
-                "Compare the current page to the pass criteria. If it matches, terminate with success."
-            )
+        lines: list[str] = [f"Current URL: {current_url}", f"Rounds left: {rounds_left}"]
+
         if self._page_changed:
             lines.append("")
-            lines.append(
-                "The page changed. Evaluate for PASS/FAIL now. Do NOT redo earlier steps unless an error demands it."
-            )
+            lines.append("Page changed since last round. Evaluate pass/fail on this page before new actions.")
         if self._just_submitted:
             lines.append("")
-            lines.append(
-                "You just submitted. Do NOT refill the form. Evaluate and terminate success/failure."
-            )
-        lines.append("")
-        lines.append(
-            "If you clicked submit/confirm or pressed Enter, evaluate the new page and terminate."
-        )
-        lines.append(
-            "If stuck clicking the same element, change approach or terminate with failure."
-        )
+            lines.append("You just submitted. Do NOT resubmit. Evaluate and terminate success/failure.")
+
+        suggestion = self._suggest_visible_click_target(test_case=test_case, page_text=self._last_page_text or "")
+        if suggestion:
+            lines.append("")
+            lines.append(f"If you can see \"{suggestion}\", click it now to proceed.")
+
+        # Lightweight "what's satisfied here" hint for the policy model (no big text dumps).
+        try:
+            scoped = self._extract_scoped_expectations_for_url(test_case, current_url)
+            lower_text = (self._last_page_text or "").lower()
+            satisfied = [e for e in scoped if e.lower() in lower_text]
+            if satisfied:
+                lines.append("")
+                lines.append("Current page satisfies:")
+                for expected in satisfied[:2]:
+                    lines.append(f"- \"{expected}\"")
+        except Exception:
+            pass
+
+        if self._verified_expectations:
+            lines.append("")
+            lines.append("Verified so far:")
+            for url, expected in self._verified_expectations[-3:]:
+                lines.append(f"- {url} contains \"{expected}\"")
+
         if action_history:
             lines.append("")
             lines.append("Recent actions:")
-            lines.extend(action_history[-6:])
+            lines.extend(action_history[-2:])
+
         repeat_warnings = self._get_repeat_warnings()
         if repeat_warnings:
             lines.append("")
             lines.append("Avoid redundant actions:")
             lines.extend(repeat_warnings)
-        if self.scroll_history:
-            last_scroll = self.scroll_history[-1]
-            sh = last_scroll.get("scrollHeight", 0) or 1
-            y = last_scroll.get("y", 0)
-            pct = (y / sh) * 100
-            lines.append("")
-            lines.append(f"Scroll position: {y:.0f}/{sh:.0f} ({pct:.1f}%).")
-            recent_dirs = [s["direction"] for s in self.scroll_history[-6:]]
-            if "up" in recent_dirs and "down" in recent_dirs and len(recent_dirs) >= 4:
-                lines.append(
-                    "Loop warning: Scrolling up/down repeatedly. Click a result instead."
-                )
+
         lines.append("")
-        lines.append(
-            "When confident, call terminate with status 'success' or 'failure' and a reason."
-        )
+        lines.append("If you cannot make progress in 2-3 actions, terminate with FAILURE and explain the blocker.")
+        lines.append("Avoid re-opening the same URL repeatedly if it is already loaded and verified.")
+        lines.append("When confident, call terminate with status 'success' or 'failure' and a reason.")
+        return "\n".join(lines)
+
+    def _suggest_visible_click_target(self, *, test_case: TestCase, page_text: str) -> str | None:
+        """
+        Very small, task-derived hint: if an objective step includes a click target in quotes and that exact
+        text is currently visible on the page, suggest clicking it. Avoid repeating targets we've already clicked.
+        """
+        text_lower = (page_text or "").lower()
+        if not text_lower:
+            return None
+
+        already_clicked = {
+            (tr.get("clicked_text") or "").strip().lower()
+            for tr in self._transitions
+            if tr.get("action") == "left_click" and tr.get("clicked_text")
+        }
+        for step in test_case.objective_steps or []:
+            if "click" not in step.lower():
+                continue
+            target = self._extract_expected_text(step)
+            if not target:
+                continue
+            target_lower = target.lower()
+            if target_lower in already_clicked:
+                continue
+            if target_lower in text_lower:
+                return target
+        return None
+
+    def _extract_scoped_expectations_for_url(self, test_case: TestCase, url: str) -> list[str]:
+        """Return quoted expectations that are explicitly scoped to a URL in the task text."""
+        url_norm = self._normalize_for_compare(url)
+
+        def _url_in_text(s: str) -> str | None:
+            match = re.search(r"https?://\S+", s)
+            if not match:
+                return None
+            return self._normalize_for_compare(match.group(0))
+
+        def _is_verify_step(s: str) -> bool:
+            sl = s.lower()
+            return any(term in sl for term in ("verify", "assert", "confirm", "check", "ensure", "validate", "expect"))
+
+        def _looks_like_page_content_assertion(s: str) -> bool:
+            """
+            Only treat quoted text in steps as a page-content expectation when the step explicitly
+            talks about content/text/labels, not just navigation (e.g. 'browser is at URL').
+            """
+            sl = s.lower()
+            if any(phrase in sl for phrase in ("browser is at", "url is", "address is")):
+                return False
+            return any(term in sl for term in ("contains", "shows", "visible", "text", "label", "heading"))
+
+        def _scoped_step_url(step: str) -> str | None:
+            """
+            Extract a URL that is explicitly presented as the page-under-test for this step.
+            This avoids mis-scoping expectations in steps like:
+              'Click CTA \"X\" and verify the browser returns to http://...'
+            """
+            m = re.search(
+                r"\b(?:on|open|visit|at|navigate to)\s+(https?://\S+)",
+                step,
+                flags=re.IGNORECASE,
+            )
+            if not m:
+                return None
+            return self._normalize_for_compare(m.group(1))
+
+        out: list[str] = []
+        for step in test_case.objective_steps or []:
+            step_url = _scoped_step_url(step)
+            if step_url and step_url == url_norm and _is_verify_step(step) and _looks_like_page_content_assertion(step):
+                expected = self._extract_expected_text(step)
+                if expected:
+                    out.append(expected)
+        for crit in test_case.pass_criteria or []:
+            crit_url = _url_in_text(crit)
+            if crit_url and crit_url == url_norm:
+                expected = self._extract_expected_text(crit)
+                if expected:
+                    out.append(expected)
+        # de-dupe, stable order
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for e in out:
+            if e not in seen:
+                seen.add(e)
+                uniq.append(e)
+        return uniq
+
+    def _parse_url_in_text(self, text: str) -> str | None:
+        match = re.search(r"https?://\S+", text or "")
+        if not match:
+            return None
+        return self._normalize_for_compare(match.group(0))
+
+    def _extract_click_target_texts(self, test_case: TestCase) -> list[str]:
+        """Extract quoted click target texts from objective steps (best-effort)."""
+        out: list[str] = []
+        for step in test_case.objective_steps or []:
+            sl = step.lower()
+            if "click" not in sl:
+                continue
+            expected = self._extract_expected_text(step)
+            if expected:
+                out.append(expected)
+        return out
+
+    def _check_auto_pass(self, *, test_case: TestCase, current_url: str) -> tuple[bool, str | None]:
+        """
+        Auto-pass when:
+        - All URL-scoped quoted expectations in pass_criteria were observed on their URLs
+        - If pass_criteria mentions a final URL (e.g. 'browser is at http://...'), we are there
+        - If the task includes a click step with a quoted target that should lead to the final URL,
+          we have evidence of a click-driven transition to that final URL.
+        """
+        pass_criteria = test_case.pass_criteria or []
+        if not pass_criteria:
+            return False, None
+
+        # 1) Check URL-scoped quote expectations (url + quote).
+        required_pairs: list[tuple[str, str]] = []
+        final_url_norm: str | None = None
+        for crit in pass_criteria:
+            crit = str(crit)
+            url_norm = self._parse_url_in_text(crit)
+            expected = self._extract_expected_text(crit)
+            if url_norm and expected:
+                required_pairs.append((url_norm, expected))
+            # Try to infer an explicit final URL requirement.
+            if url_norm and expected is None and any(
+                phrase in crit.lower() for phrase in ("browser is at", "is at", "returns to", "at ")
+            ):
+                final_url_norm = url_norm
+
+        if required_pairs:
+            observed = {(self._normalize_for_compare(u), e) for (u, e) in self._verified_expectations}
+            for url_norm, expected in required_pairs:
+                if (url_norm, expected) in observed:
+                    continue
+                # allow current page too
+                if self._normalize_for_compare(current_url) == url_norm and expected.lower() in (
+                    self._last_page_text or ""
+                ).lower():
+                    continue
+                return False, None
+
+        # If no explicit final URL in criteria, we can't safely auto-pass.
+        if not final_url_norm:
+            return False, None
+
+        if self._normalize_for_compare(current_url) != final_url_norm:
+            return False, None
+
+        # 2) Evidence of click-driven transition to final URL.
+        click_targets = [t.lower() for t in self._extract_click_target_texts(test_case)]
+        if click_targets:
+            for tr in reversed(self._transitions):
+                if tr.get("to") != final_url_norm:
+                    continue
+                if tr.get("action") != "left_click":
+                    continue
+                clicked = (tr.get("clicked_text") or "").strip().lower()
+                if clicked and clicked in click_targets:
+                    return True, f"All URL-scoped pass criteria satisfied and clicked '{clicked}' navigated to final URL."
+            return False, None
+
+        # No click targets; don't guess.
+        return False, None
+
+    def _build_task_brief(self, test_case: TestCase) -> str:
+        """Static task definition sent as system message once."""
+        lines: list[str] = [f"Objective: {test_case.objective}"]
+        if test_case.objective_steps:
+            lines.append("")
+            lines.append("Steps to follow:")
+            for idx, step in enumerate(test_case.objective_steps, start=1):
+                lines.append(f"{idx}. {step}")
+        if test_case.pass_criteria:
+            lines.append("")
+            lines.append("Pass criteria:")
+            lines.extend([f"- {item}" for item in test_case.pass_criteria])
+        if test_case.fail_criteria:
+            lines.append("")
+            lines.append("Fail criteria:")
+            lines.extend([f"- {item}" for item in test_case.fail_criteria])
+        if test_case.notes:
+            lines.append("")
+            lines.append(f"Notes: {test_case.notes}")
+        if test_case.credentials:
+            lines.append("")
+            lines.append("Credentials (keep safe):")
+            for k, v in test_case.credentials.items():
+                lines.append(f"- {k}: {v}")
         return "\n".join(lines)
 
     def _bucket_coord(self, coord: list[float] | tuple[float, float]) -> tuple[int, int]:
@@ -501,6 +758,62 @@ class FaraAgent:
             self._click_counts[bucket] = self._click_counts.get(bucket, 0) + 1
         if action == "type":
             self._type_counts[bucket] = self._type_counts.get(bucket, 0) + 1
+
+    def _record_visit(self, url: str) -> None:
+        """Track repeated visits to the same URL to catch navigation loops."""
+        norm = self._normalize_for_compare(url)
+        self._visit_counts[norm] = self._visit_counts.get(norm, 0) + 1
+
+    def _action_signature(self, action_args: dict[str, Any]) -> str:
+        """Create a coarse signature for repeat-action detection."""
+        action = str(action_args.get("action") or "")
+        url = self._normalize_for_compare(self.browser.get_url())
+        coord = action_args.get("coordinate")
+        bucket = None
+        if isinstance(coord, list) and len(coord) == 2:
+            scaled = self._convert_resized_coords_to_viewport(coord)
+            bucket = self._bucket_coord(scaled)
+        pixels = action_args.get("pixels")
+        if pixels is not None:
+            pixels = int(pixels)
+        return f"{action}|{url}|{bucket}|{pixels}"
+
+    def _write_trace(
+        self,
+        trace_path: Optional[Path],
+        *,
+        test_case: TestCase,
+        started_at: datetime,
+        actions: list[ActionTrace],
+        reason: str | None = None,
+        success: bool | None = None,
+    ) -> None:
+        """Persist a lightweight partial trace for debugging even if cancelled."""
+        if not trace_path:
+            return
+        try:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "task_id": test_case.id,
+                "objective": test_case.objective,
+                "success": success,
+                "reason": reason,
+                "started_at": started_at.isoformat(),
+                "actions": [
+                    {
+                        "round": a.round_index,
+                        "action": a.action,
+                        "result": a.result,
+                        "url": a.page_url,
+                        "model_response": a.model_response,
+                        "screenshot": str(a.screenshot_path) if a.screenshot_path else None,
+                    }
+                    for a in actions
+                ],
+            }
+            trace_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self.logger.warning(f"Failed to write trace file {trace_path}: {exc}")
 
     def _get_repeat_warnings(self) -> list[str]:
         """Return hints to avoid flapping on the same element."""
@@ -523,10 +836,13 @@ class FaraAgent:
         """Return a reason to abort if we are looping on the same element."""
         max_clicks = max(self._click_counts.values(), default=0)
         max_types = max(self._type_counts.values(), default=0)
+        max_visits = max(self._visit_counts.values(), default=0)
         if max_clicks >= 4:
             return "Loop detected: clicked the same region 4+ times without progress."
         if max_types >= 3:
             return "Loop detected: typed in the same field 3+ times without progress."
+        # Visiting the same page repeatedly is often benign in SPA flows unless we are failing to satisfy
+        # URL-scoped expectations; rely on the more specific loop_missing_text breaker instead.
         return None
 
     def _check_auto_verdict(
@@ -561,15 +877,64 @@ class FaraAgent:
 
         return None, None
 
+    def _extract_expected_text(self, criteria: str) -> Optional[str]:
+        """Extract quoted expectation from criteria."""
+        match = re.search(r'"([^"]+)"', criteria) or re.search(r"'([^']+)'", criteria)
+        if match:
+            return match.group(1).strip()
+        return None
+
+    def _extract_expected_texts(self, criteria: list[str]) -> list[str]:
+        """Extract all quoted expectations from a list of strings."""
+        out: list[str] = []
+        for item in criteria:
+            expected = self._extract_expected_text(str(item))
+            if expected:
+                out.append(expected)
+        return out
+
+    def _check_text_expectations(
+        self,
+        *,
+        test_case: TestCase,
+        current_url: str,
+        page_text: str,
+        page_changed: bool,
+    ) -> tuple[Optional[bool], Optional[str]]:
+        """
+        Fast-fail:
+        - Only evaluate immediately after a navigation/page-change.
+        - Only enforce quoted expectations that are explicitly scoped to the current page via a URL
+          in objective_steps or pass_criteria (best practice for machine-checkable tasks).
+        """
+        if not page_changed:
+            return None, None
+
+        url_norm = self._normalize_for_compare(current_url)
+        text_lower = (page_text or "").lower()
+
+        expectations = self._extract_scoped_expectations_for_url(test_case, current_url)
+
+        if not expectations:
+            return None, None
+
+        missing = [e for e in expectations if e.lower() not in text_lower]
+        if missing:
+            return False, f"Expected text '{missing[0]}' missing after navigation."
+
+        return None, None
+
     async def run_test_case(
         self,
         *,
         test_case: TestCase,
         run_id: str,
         screenshots_root: Path,
+        trace_path: Optional[Path] = None,
     ) -> TestRunResult:
         """Run a TestCase and collect traces."""
         self.logger.info(f"Running test case: {test_case.id}")
+        self._current_run_id = run_id
         original_max = self.max_rounds
         if test_case.max_rounds:
             self.max_rounds = test_case.max_rounds
@@ -579,8 +944,16 @@ class FaraAgent:
         self.scroll_history.clear()
         self._click_counts.clear()
         self._type_counts.clear()
+        self._visit_counts.clear()
+        self.reasoning_history.clear()
+        self._last_action_signature = None
+        self._repeat_action_streak = 0
         self.facts.clear()
         self._console_errors.clear()
+        self._visited_url_norms.clear()
+        self._page_changed_since_last_action = False
+        self._verified_expectations.clear()
+        self._transitions.clear()
 
         if test_case.start_url:
             await self.browser.goto(test_case.start_url)
@@ -589,6 +962,9 @@ class FaraAgent:
                 await self.browser.wait_for_load_state("networkidle", timeout=5000)
             except Exception:
                 pass  # Continue even if network doesn't become idle
+            self._visit_counts.clear()
+            self._record_visit(test_case.start_url)
+            self._visited_url_norms.add(self._normalize_for_compare(test_case.start_url))
 
         screenshot_dir = screenshots_root / run_id
         if self.save_screenshots:
@@ -604,28 +980,127 @@ class FaraAgent:
         screenshot = await self._get_screenshot()
         page_title = await self.browser.get_title()
         page_text = await self.browser.get_body_text()
+        self._last_page_text = page_text or ""
         self._last_url_norm = self._normalize_for_compare(self.browser.get_url())
+        if self._last_url_norm:
+            self._visited_url_norms.add(self._last_url_norm)
+        # Populate verified expectations visible on the initial page.
+        try:
+            for expected in self._extract_scoped_expectations_for_url(test_case, self.browser.get_url()):
+                if expected.lower() in (page_text or "").lower():
+                    pair = (self.browser.get_url(), expected)
+                    if pair not in self._verified_expectations:
+                        self._verified_expectations.append(pair)
+        except Exception:
+            pass
         prompt_data = get_computer_use_system_prompt(screenshot, self.MLM_PROCESSOR_IM_CFG)
+        # Keep the model coordinate space 1:1 with the real browser viewport when possible.
+        if self.config.get("sync_viewport_to_prompt", True):
+            try:
+                target_w, target_h = prompt_data["im_size"]
+                if (self.viewport_width, self.viewport_height) != (target_w, target_h):
+                    await self.browser.set_viewport_size(target_w, target_h)
+                    self.viewport_width, self.viewport_height = target_w, target_h
+                    await asyncio.sleep(0.2)
+                    screenshot = await self._get_screenshot()
+                    prompt_data = get_computer_use_system_prompt(screenshot, self.MLM_PROCESSOR_IM_CFG)
+            except Exception:
+                pass
         system_prompt = SystemMessage(
             content=prompt_data["content"]
             + "\n\nYou are executing an end-to-end test case. Be decisive and avoid loops."
         )
+        task_brief_msg = SystemMessage(content=self._build_task_brief(test_case))
         action_history: list[str] = []
 
         for round_num in range(self.max_rounds):
             self.round_count = round_num + 1
             self.logger.info(f"Round {self.round_count}/{self.max_rounds}")
 
-            current_url_norm = self._normalize_for_compare(self.browser.get_url())
-            self._page_changed = current_url_norm != (self._last_url_norm or "")
+            # page_changed refers to a navigation that happened since the previous model action.
+            self._page_changed = bool(self._page_changed_since_last_action)
             if self._page_changed:
                 self._click_counts.clear()
                 self._type_counts.clear()
 
+            # Auto-check simple textual expectations when the target block is visible.
+            text_status, text_reason = self._check_text_expectations(
+                test_case=test_case,
+                current_url=self.browser.get_url(),
+                page_text=page_text,
+                page_changed=self._page_changed,
+            )
+            if text_status is not None:
+                success = bool(text_status)
+                fail_reason = text_reason or ("Auto pass" if success else "Auto fail")
+                screenshot_path = None
+                if self.save_screenshots:
+                    screenshot_path = screenshot_dir / f"step-{round_num + 1:02d}.png"
+                    if not screenshot_path.exists():
+                        screenshot.save(screenshot_path)
+                actions.append(
+                    ActionTrace(
+                        round_index=round_num + 1,
+                        action="auto_terminate",
+                        arguments={
+                            "auto": True,
+                            "status": "success" if success else "failure",
+                            "source": "text_expectations",
+                        },
+                        model_response="",
+                        result=fail_reason,
+                        page_url=self.browser.get_url(),
+                        screenshot_path=screenshot_path,
+                        timestamp=datetime.utcnow(),
+                    )
+                )
+                self._write_trace(
+                    trace_path,
+                    test_case=test_case,
+                    started_at=start_time,
+                    actions=actions,
+                    reason=fail_reason,
+                    success=success,
+                )
+                break
+
+            # Supervisor auto-pass: if URL-scoped pass criteria are satisfied and the required
+            # navigation transition (e.g., CTA click) is evidenced, terminate successfully.
+            auto_pass, auto_pass_reason = self._check_auto_pass(test_case=test_case, current_url=self.browser.get_url())
+            if auto_pass:
+                success = True
+                fail_reason = auto_pass_reason or "Pass criteria satisfied."
+                screenshot_path = None
+                if self.save_screenshots:
+                    screenshot_path = screenshot_dir / f"step-{round_num + 1:02d}.png"
+                    if not screenshot_path.exists():
+                        screenshot.save(screenshot_path)
+                actions.append(
+                    ActionTrace(
+                        round_index=round_num + 1,
+                        action="auto_terminate",
+                        arguments={"auto": True, "status": "success", "source": "auto_pass"},
+                        model_response="",
+                        result=fail_reason,
+                        page_url=self.browser.get_url(),
+                        screenshot_path=screenshot_path,
+                        timestamp=datetime.utcnow(),
+                    )
+                )
+                self._write_trace(
+                    trace_path,
+                    test_case=test_case,
+                    started_at=start_time,
+                    actions=actions,
+                    reason=fail_reason,
+                    success=True,
+                )
+                break
+
+
             context_text = self._build_context_text(
                 test_case, action_history, self.max_rounds - round_num
             )
-            context_text = f"{context_text}\n\nPage title: {page_title}\nPage text snippet: {page_text[:220]}"
             user_content = [
                 ImageObj.from_pil(screenshot.resize(prompt_data["im_size"])),
                 context_text,
@@ -633,24 +1108,61 @@ class FaraAgent:
             self.last_im_size = prompt_data["im_size"]
             user_message = UserMessage(content=user_content)
             self.message_history.append(user_message)
-            pruned_users = self._prune_user_messages()
+            latest_user = self._latest_user_message()
 
-            messages_for_model = [system_prompt, *pruned_users]
+            messages_for_model = [system_prompt, task_brief_msg, *latest_user]
             
             try:
                 response = await self._call_model(messages_for_model)
             except LLMError as e:
                 fail_reason = f"LLM error: {e}"
                 break
-                
+            
             self.logger.info(f"Model response: {response[:200]}...")
             if self.show_overlay:
                 await self.browser.update_overlay(f"[INFO] Model response: {response[:300]}")
 
             action_args = self._parse_action(response)
             if not action_args:
-                fail_reason = "Model did not return a valid tool call."
-                break
+                # One repair turn: ask for a strict tool_call only.
+                repair_prompt = UserMessage(
+                    content=(
+                        "Return ONLY:\n<tool_call>\n{...}\n</tool_call>\n"
+                        "No whitespace or text outside the tags. No markdown. No explanations.\n"
+                        "Inside {…} return JSON like {\"name\":\"computer_use\",\"arguments\":{...}}."
+                    )
+                )
+                try:
+                    response = await self._call_model([system_prompt, task_brief_msg, *latest_user, repair_prompt])
+                    action_args = self._parse_action(response)
+                except Exception:
+                    action_args = None
+                if not action_args:
+                    fail_reason = "Model did not return a valid tool call."
+                    break
+
+            # Clear one-shot flags after they've been included in the prompt.
+            self._page_changed_since_last_action = False
+            self._page_changed = False
+            self._just_submitted = False
+
+            # Record concise reasoning (strip tool_call JSON).
+            reason_text = response.split("<tool_call>")[0].strip() or response.strip()
+            if reason_text:
+                trimmed = reason_text[:400]
+                self.reasoning_history.append(trimmed)
+                self.reasoning_history = self.reasoning_history[-4:]
+
+            # Auto-memorize stable hints.
+            try:
+                if test_case.start_url:
+                    url_norm = self._normalize_for_compare(self.browser.get_url())
+                    if url_norm == self._normalize_for_compare(test_case.start_url):
+                        fact = f"Visited start_url: {test_case.start_url}"
+                        if fact not in self.facts:
+                            self.facts.append(fact)
+            except Exception:
+                pass
 
             if action_args.get("action") == "terminate":
                 status = action_args.get("status", "").lower() or "failure"
@@ -669,12 +1181,46 @@ class FaraAgent:
                         timestamp=datetime.utcnow(),
                     )
                 )
+                self._write_trace(
+                    trace_path,
+                    test_case=test_case,
+                    started_at=start_time,
+                    actions=actions,
+                    reason=fail_reason,
+                    success=success,
+                )
                 break
 
             action_start = datetime.utcnow()
+            before_url_norm = self._normalize_for_compare(self.browser.get_url())
             result = await self._execute_action(action_args)
             action_duration = (datetime.utcnow() - action_start).total_seconds() * 1000
             self.logger.info(f"Action result: {result}")
+
+            # Repeat-action streak detector (helps break nav/scroll loops early).
+            action_sig = self._action_signature(action_args)
+            if action_sig == self._last_action_signature:
+                self._repeat_action_streak += 1
+            else:
+                self._repeat_action_streak = 1
+                self._last_action_signature = action_sig
+
+            if self._repeat_action_streak >= 3:
+                fail_reason = "Loop detected: repeated the same action 3 times in a row without progress."
+                actions.append(
+                    ActionTrace(
+                        round_index=round_num + 1,
+                        action=action_args.get("action", "unknown"),
+                        arguments=action_args,
+                        model_response=response,
+                        result=fail_reason,
+                        page_url=self.browser.get_url(),
+                        screenshot_path=None,
+                        timestamp=datetime.utcnow(),
+                        duration_ms=action_duration,
+                    )
+                )
+                break
 
             loop_reason = self._detect_loop_blocker()
             if loop_reason:
@@ -692,6 +1238,14 @@ class FaraAgent:
                         duration_ms=action_duration,
                     )
                 )
+                self._write_trace(
+                    trace_path,
+                    test_case=test_case,
+                    started_at=start_time,
+                    actions=actions,
+                    reason=fail_reason,
+                    success=False,
+                )
                 break
 
             # Wait for page to stabilize
@@ -704,9 +1258,42 @@ class FaraAgent:
             screenshot = await self._get_screenshot()
             page_title = await self.browser.get_title()
             page_text = await self.browser.get_body_text()
-            self._last_url_norm = self._normalize_for_compare(self.browser.get_url())
-            self._page_changed = False
-            self._just_submitted = False
+            self._last_page_text = page_text or ""
+            after_url = self.browser.get_url()
+            after_url_norm = self._normalize_for_compare(after_url)
+            self._last_url_norm = after_url_norm
+            self._visited_url_norms.add(after_url_norm)
+            self._page_changed_since_last_action = after_url_norm != (before_url_norm or "")
+            # Only count visits when we actually navigated (click/back/etc).
+            if self._page_changed_since_last_action and action_args.get("action") != "visit_url":
+                self._record_visit(after_url)
+
+            # Update supervisor memory of verified URL-scoped expectations.
+            try:
+                scoped = self._extract_scoped_expectations_for_url(test_case, after_url)
+                lower_text = (page_text or "").lower()
+                for expected in scoped:
+                    if expected.lower() in lower_text:
+                        pair = (after_url, expected)
+                        if pair not in self._verified_expectations:
+                            self._verified_expectations.append(pair)
+            except Exception:
+                pass
+
+            # Record navigation transitions for evidence of click-driven navigation.
+            try:
+                if self._page_changed_since_last_action:
+                    self._transitions.append(
+                        {
+                            "from": before_url_norm,
+                            "to": after_url_norm,
+                            "action": action_args.get("action"),
+                            "clicked_text": action_args.get("_clicked_text"),
+                        }
+                    )
+                    self._transitions = self._transitions[-20:]
+            except Exception:
+                pass
 
             # Capture console errors
             console_msgs = self.browser.get_console_messages()
@@ -741,6 +1328,14 @@ class FaraAgent:
                     console_errors=console_errors[-3:] if console_errors else None,
                 )
             )
+            self._write_trace(
+                trace_path,
+                test_case=test_case,
+                started_at=start_time,
+                actions=actions,
+                reason=None,
+                success=None,
+            )
 
             action_summary = f"{round_num + 1}. {action_args.get('action')}: {result}"
             action_history.append(action_summary)
@@ -767,13 +1362,64 @@ class FaraAgent:
                         timestamp=datetime.utcnow(),
                     )
                 )
+                self._write_trace(
+                    trace_path,
+                    test_case=test_case,
+                    started_at=start_time,
+                    actions=actions,
+                    reason=fail_reason,
+                    success=success,
+                )
                 break
+
+            # Hard loop breaker: if we've visited this URL 3+ times and its *URL-scoped*
+            # expected text is still missing, fail.
+            norm_url = self._normalize_for_compare(self.browser.get_url())
+            url_visits = self._visit_counts.get(norm_url, 0)
+            scoped_expectations = self._extract_scoped_expectations_for_url(test_case, self.browser.get_url())
+            if url_visits >= 3 and scoped_expectations:
+                page_lower = (page_text or "").lower()
+                missing = [e for e in scoped_expectations if e.lower() not in page_lower]
+                if missing:
+                    success = False
+                    fail_reason = f"Loop detected: visited same page 3+ times and missing expected text '{missing[0]}'."
+                    actions.append(
+                        ActionTrace(
+                            round_index=round_num + 1,
+                            action="auto_terminate",
+                            arguments={"auto": True, "status": "failure", "source": "loop_missing_text"},
+                            model_response=response,
+                            result=fail_reason,
+                            page_url=self.browser.get_url(),
+                            screenshot_path=screenshot_path,
+                            timestamp=datetime.utcnow(),
+                        )
+                    )
+                    self._write_trace(
+                        trace_path,
+                        test_case=test_case,
+                        started_at=start_time,
+                        actions=actions,
+                        reason=fail_reason,
+                        success=False,
+                    )
+                    break
 
             prompt_data = get_computer_use_system_prompt(screenshot, self.MLM_PROCESSOR_IM_CFG)
 
         end_time = datetime.utcnow()
         self.max_rounds = original_max
         reason = "Completed successfully." if success else fail_reason
+
+        # Final trace flush
+        self._write_trace(
+            trace_path,
+            test_case=test_case,
+            started_at=start_time,
+            actions=actions,
+            reason=reason,
+            success=success,
+        )
 
         return TestRunResult(
             case=test_case,

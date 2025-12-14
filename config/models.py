@@ -53,6 +53,10 @@ class AgentConfig(BaseModel):
         le=10,
         description="Maximum number of images to include in context",
     )
+    debug_log_requests: bool = Field(
+        default=False,
+        description="Log full LLM request payloads (for debugging context/loops)",
+    )
 
     @field_validator("base_url")
     @classmethod
@@ -191,7 +195,7 @@ class FaraConfig(BaseModel):
         # Map flat keys to nested structure
         agent_keys = {
             "model", "base_url", "api_key", "temperature",
-            "max_rounds", "max_tokens", "max_n_images"
+            "max_rounds", "max_tokens", "max_n_images", "debug_log_requests"
         }
         browser_keys = {
             "browser", "headless", "viewport_width", "viewport_height",

@@ -44,6 +44,7 @@ def _parse_task(data: Dict[str, Any], fallback_id: str) -> TestCase:
     if not objective:
         raise TaskValidationError(f"Task is missing an 'objective' field", task_id=task_id, field="objective")
 
+    objective_steps = _as_list(data.get("objective_steps") or data.get("steps"))
     pass_criteria = _as_list(data.get("pass_criteria") or data.get("pass"))
     fail_criteria = _as_list(data.get("fail_criteria") or data.get("fail"))
 
@@ -98,6 +99,7 @@ def _parse_task(data: Dict[str, Any], fallback_id: str) -> TestCase:
     return TestCase(
         id=task_id,
         objective=str(objective),
+        objective_steps=objective_steps,
         pass_criteria=pass_criteria,
         fail_criteria=fail_criteria,
         start_url=data.get("start_url"),
@@ -220,6 +222,12 @@ def validate_task(data: Dict[str, Any]) -> List[str]:
         errors.append("Missing required field: fail_criteria")
     elif not isinstance(fail_criteria, (str, list)):
         errors.append("fail_criteria must be a string or list")
+
+    objective_steps = data.get("objective_steps") or data.get("steps")
+    if objective_steps is None:
+        errors.append("Missing required field: objective_steps (ordered steps the agent should follow)")
+    elif not isinstance(objective_steps, (str, list)):
+        errors.append("objective_steps must be a string or list")
     
     credentials = data.get("credentials")
     if credentials is not None and not isinstance(credentials, dict):
