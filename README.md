@@ -4,6 +4,7 @@ A production-ready AI-powered end-to-end testing framework that uses vision-lang
 
 <a href="https://www.youtube.com/watch?v=ptI_Tz1mams"><img alt="image" src="https://github.com/user-attachments/assets/e7eccf41-8028-4444-b07b-db980dbf4129" /></a>
 
+<a href="https://www.youtube.com/watch?v=bxhdKAq_y24"><img alt="image" src="https://github.com/user-attachments/assets/736f492b-5ee6-48d3-8226-f979a2d0de1f" /></a>
 
 
 ## Features
